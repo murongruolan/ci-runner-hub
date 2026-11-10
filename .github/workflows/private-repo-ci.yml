@@ -105,3 +105,65 @@ jobs:
             echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "- 结论: ${{ job.status }}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  node-ci:
+    # Node 项目通道（murongruolan/parahuman-aurabot）：与该仓库 .github/workflows/pr-check.yml
+    # 的 job 集合对齐（contract / archive / consumer 同源检查）。计费阻塞时的等价公共通道。
+    if: inputs.target_repo == 'murongruolan/parahuman-aurabot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 校验输入（白名单 + 40 位 SHA）
+        run: |
+          set -e
+          case "${{ inputs.target_repo }}" in
+            murongruolan/parahuman-memory-core|murongruolan/parahuman-aurabot|murongruolan/parahuman-research) ;;
+            *) echo "repo 不在白名单"; exit 1 ;;
+          esac
+          echo "${{ inputs.target_sha }}" | grep -qE '^[0-9a-f]{40}$' || { echo "SHA 必须是完整 40 位十六进制"; exit 1; }
+
+      - name: 检出私有仓库（PAT 仅本步骤可见；不持久化凭据）
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4（固定版本）
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ inputs.target_sha }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: 核验检出 SHA 与请求一致 + 清除持久化凭据
+        run: |
+          set -e
+          actual=$(git rev-parse HEAD)
+          [ "$actual" = "${{ inputs.target_sha }}" ] || { echo "SHA 不符: $actual"; exit 1; }
+          git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          rm -f "$HOME/.git-credentials" 2>/dev/null || true
+          env | grep -i PRIVATE_REPO_PAT && { echo "PAT 环境变量泄漏"; exit 1; } || echo "env 无 PAT 残留"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # 与私仓 pr-check.yml 三 job 一一对应；测试为自包含 ESM 脚本（node:sqlite 需 ≥22.5）
+      - name: contract tests
+        run: node integration-tests/contract-tests.mjs
+
+      - name: consumer build 同源检查
+        run: node build/build-archive-consumer.mjs --check
+
+      - name: archive tests（T1-T14）
+        run: node integration-tests/archive-tests.mjs
+
+      - name: archive consumer tests（C1-C14，含真实 Bridge 隔离回归 C11）
+        run: node integration-tests/archive-consumer-tests.mjs
+
+      - name: Job 摘要
+        if: always()
+        run: |
+          {
+            echo "### CI 结果（node-ci）"
+            echo "- 被测仓库: ${{ inputs.target_repo }}"
+            echo "- Commit: ${{ inputs.target_sha }}"
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- 结论: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
