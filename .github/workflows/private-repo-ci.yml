@@ -1,0 +1,107 @@
+# private-repo-ci.yml — ParaHuman 私有仓库公共 CI 中枢
+#
+# 安全模型（如实声明）：
+# - 触发：仅 workflow_dispatch（无 push/pull_request 触发）——Fork PR 不会自动
+#   携带 PRIVATE_REPO_PAT 执行；只有对本仓库有 write 权限的协作者可手动调度。
+# - 受信任提交边界：repo 必须在白名单内、SHA 必须是 40 位十六进制且真实存在于
+#   该私有仓库（checkout 失败即 FAIL）。白名单 = 私有仓库写入者信任域。
+# - 残余风险（如实）：具有本公共仓库 write 权限的协作者可调度任意白名单 SHA——
+#   该 SHA 的测试代码可能读取运行环境。缓解：PAT 仅在 checkout 步骤可见
+#   （persist-credentials: false，检出后清除持久化凭据），测试步骤无 PAT 环境变量；
+#   不上传私有源码 Artifact；不缓存工作目录。
+# - 日志公开：本工作流不打印 Token、不打印私有源码全文；Go 测试输出仅含
+#   测试结果与文件路径。
+
+name: private-repo-ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: '私有仓库（白名单）'
+        required: true
+        type: choice
+        options:
+          - murongruolan/parahuman-memory-core
+          - murongruolan/parahuman-aurabot
+          - murongruolan/parahuman-research
+      target_sha:
+        description: '完整 40 位 Commit SHA'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ inputs.target_repo }}-${{ inputs.target_sha }}
+  cancel-in-progress: false
+
+jobs:
+  go-ci:
+    # Go 项目通道（当前仅 parahuman-memory-core；其余白名单仓库接入时按实际结构扩展）
+    if: inputs.target_repo == 'murongruolan/parahuman-memory-core'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 校验输入（白名单 + 40 位 SHA）
+        run: |
+          set -e
+          case "${{ inputs.target_repo }}" in
+            murongruolan/parahuman-memory-core|murongruolan/parahuman-aurabot|murongruolan/parahuman-research) ;;
+            *) echo "repo 不在白名单"; exit 1 ;;
+          esac
+          echo "${{ inputs.target_sha }}" | grep -qE '^[0-9a-f]{40}$' || { echo "SHA 必须是完整 40 位十六进制"; exit 1; }
+          echo "repo=${{ inputs.target_repo }} sha=${{ inputs.target_sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: 检出私有仓库（PAT 仅本步骤可见；不持久化凭据）
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4（固定版本）
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ inputs.target_sha }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: 核验检出 SHA 与请求一致
+        run: |
+          set -e
+          actual=$(git rev-parse HEAD)
+          [ "$actual" = "${{ inputs.target_sha }}" ] || { echo "SHA 不符: $actual"; exit 1; }
+          echo "checked-out=$actual" >> "$GITHUB_OUTPUT"
+
+      - name: 清除任何持久化 Git 凭据
+        run: |
+          set -e
+          git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          rm -f "$HOME/.git-credentials" 2>/dev/null || true
+          env | grep -i PRIVATE_REPO_PAT && { echo "PAT 环境变量泄漏"; exit 1; } || echo "env 无 PAT 残留"
+
+      - name: Setup Go（go.mod 权威版本）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test（全量）
+        run: go test ./... -count=1
+
+      - name: go race（全量，-timeout 25m）
+        run: go test -race ./... -count=1 -timeout 25m
+
+      - name: Job 摘要
+        if: always()
+        run: |
+          {
+            echo "### CI 结果"
+            echo "- 被测仓库: ${{ inputs.target_repo }}"
+            echo "- Commit: ${{ inputs.target_sha }}"
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- 结论: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
